@@ -19,6 +19,7 @@
 #                     Make package caches read-only instead of overlaid (see
 #                     cache_paths below); use --rw to make one persistent
 #   --no-agent-paths  Don't make the agents' config/state dirs writable
+#   -q, --quiet       Don't print the startup summary
 #   -v, --verbose     Print the bwrap command line before running it
 #   -h, --help        Show this help
 #
@@ -41,13 +42,32 @@
 
 set -euo pipefail
 
-usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0"; }
-die() { echo "agent-sandbox: $*" >&2; exit 1; }
+# Colors only on a terminal, and never with NO_COLOR (https://no-color.org).
+colors() {
+  if [[ -t $1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]; then
+    B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' M=$'\e[35m' N=$'\e[0m'
+  else
+    B= D= R= G= Y= C= M= N=
+  fi
+}
+colors 2
+
+usage() {
+  colors 1
+  sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0" | sed -E \
+    -e "1s/^([a-z-]+)/$B$M\1$N/" \
+    -e "s/^(Usage:)/$B\1$N/" \
+    -e "s/^(  )(-[^ ]+( [A-Z]{2,})?(, -[^ ]+( [A-Z]{2,})?)?)/\1$C\2$N/" \
+    -e "s/(\`[^\`]+\`)/$G\1$N/g"
+}
+die() { echo "${B}agent-sandbox:${N} ${B}${R}error:${N} $*" >&2; exit 1; }
+warn() { echo "${B}agent-sandbox:${N} ${Y}warning:${N} $*" >&2; }
+tilde() { local p=$1; [[ $p == "$home"* ]] && p="~${p#"$home"}"; printf '%s' "$p"; }
 
 command -v bwrap >/dev/null || die "bwrap not found (install bubblewrap)"
 
 workdir=$PWD
-share_tmp=0 net=1 protect_git=1 verbose=0 agent_paths=1
+share_tmp=0 net=1 protect_git=1 verbose=0 quiet=0 agent_paths=1
 hide_secrets=1 overlay_caches=1
 rw=() ro=() hide=() overlay=()
 
@@ -64,6 +84,7 @@ while (($#)); do
     --no-hide-secrets) hide_secrets=0; shift ;;
     --no-overlay-caches) overlay_caches=0; shift ;;
     --no-agent-paths) agent_paths=0; shift ;;
+    -q|--quiet)    quiet=1; shift ;;
     -v|--verbose)  verbose=1; shift ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; break ;;
@@ -133,8 +154,14 @@ add_defaults() {
   done
 }
 ((hide_secrets)) && add_defaults hide "${secret_paths[@]}"
-if ((overlay_caches)) && grep -q -- --tmp-overlay <<<"$bwrap_help"; then
-  add_defaults overlay "${cache_paths[@]}"
+caches_ro=0
+if ((overlay_caches)); then
+  if grep -q -- --tmp-overlay <<<"$bwrap_help"; then
+    add_defaults overlay "${cache_paths[@]}"
+  else
+    caches_ro=1
+    ((quiet)) || warn "bwrap is too old for --tmp-overlay (needs >= 0.10); package caches stay read-only"
+  fi
 fi
 
 args=(
@@ -181,7 +208,9 @@ if ((agent_paths)); then
   )
   agent_files=()
   [[ -z ${CLAUDE_CONFIG_DIR:-} ]] && agent_files+=("$HOME/.claude.json")
+  n_agent=0
   for d in "${agent_dirs[@]}"; do
+    n_agent=$((n_agent + 1))
     # Check before mkdir, so e.g. CODEX_HOME=$HOME is refused, not created.
     check_writable "$(realpath -m -- "$d")" 0
     mkdir -p -- "$d"
@@ -193,6 +222,7 @@ if ((agent_paths)); then
     [[ -f $f ]] || continue
     f=$(realpath -e -- "$f")
     check_writable "$f" 0
+    n_agent=$((n_agent + 1))
     args+=(--bind "$f" "$f")
   done
   # The installed binaries stay read-only, so self-updates can't work in here.
@@ -205,7 +235,8 @@ for p in "${rw[@]}"; do
   args+=(--bind "$p" "$p")
 done
 
-((protect_git)) && [[ -e $workdir/.git ]] && ro+=("$workdir/.git")
+git_ro=0
+((protect_git)) && [[ -e $workdir/.git ]] && { ro+=("$workdir/.git"); git_ro=1; }
 for p in "${ro[@]}"; do
   p=$(realpath -e -- "$p") || die "no such path: $p"
   args+=(--ro-bind "$p" "$p")
@@ -246,6 +277,30 @@ for p in "${hide[@]}"; do
 done
 
 args+=(--chdir "$workdir")
+
+# Startup summary on stderr, so it never mixes into the command's output.
+if ! ((quiet)) && [[ -t 2 ]]; then
+  onoff() { if (($1)); then printf '%s' "$G$2$N"; else printf '%s' "$Y$3$N"; fi; }
+  extra=()
+  ((${n_agent:-0})) && extra+=("$n_agent agent paths")
+  ((${#rw[@]})) && extra+=("${#rw[@]} --rw")
+  {
+    printf '%s\n' "${B}${M}◆ agent-sandbox${N} ${D}→${N} ${B}$*${N}"
+    printf "  ${D}%-8s${N} %s" write "${G}$(tilde "$workdir")${N}"
+    ((${#extra[@]})) && printf " ${D}(+ %s)${N}" "$(IFS=,; echo "${extra[*]}" | sed 's/,/, /g')"
+    echo
+    printf "  ${D}%-8s${N} %s\n" hide "${#hide[@]} paths"
+    if ((caches_ro)); then
+      printf "  ${D}%-8s${N} %s\n" caches "${Y}read-only${N}"
+    else
+      printf "  ${D}%-8s${N} %s\n" overlay "${#overlay[@]} paths ${D}(writes discarded)${N}"
+    fi
+    printf "  ${D}%-8s${N} %s   ${D}git${N} %s   ${D}tmp${N} %s\n" net \
+      "$(onoff "$net" on off)" \
+      "$(if [[ -e $workdir/.git ]]; then onoff "$git_ro" read-only writable; else printf "%s" "${D}none${N}"; fi)" \
+      "$(onoff "$((!share_tmp))" private shared)"
+  } >&2
+fi
 
 if ((verbose)); then
   printf 'bwrap' >&2; printf ' %q' "${args[@]}" -- "$@" >&2; echo >&2
