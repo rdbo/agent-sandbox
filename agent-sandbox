@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# agent-sandbox: run a command under bubblewrap where the whole filesystem is
+# read-only except the work directory and a private /tmp.
+#
+# Usage: agent-sandbox [options] [--] command [args...]
+#
+#   -d, --dir DIR     Writable work directory (default: current directory)
+#   --rw PATH         Extra writable path (repeatable)
+#   --ro PATH         Bind PATH read-only on top of a writable one, e.g. DIR/.git
+#   --hide PATH       Hide PATH (empty tmpfs for dirs, /dev/null for files)
+#   --overlay PATH    PATH looks writable, but all writes are discarded on exit
+#   --share-tmp       Use the host /tmp (writable) instead of a private one
+#   --no-net          Disable networking
+#   --no-protect-git  Leave DIR/.git writable (by default it's read-only, which
+#                     stops planting git hooks)
+#   --no-hide-secrets Don't hide credentials, browser profiles and shell
+#                     history (see secret_paths below)
+#   --no-overlay-caches
+#                     Make package caches read-only instead of overlaid (see
+#                     cache_paths below); use --rw to make one persistent
+#   --no-agent-paths  Don't make the agents' config/state dirs writable
+#   -v, --verbose     Print the bwrap command line before running it
+#   -h, --help        Show this help
+#
+# A command is required; to get a shell, run e.g. `agent-sandbox -- bash`.
+#
+# Your home directory, its ancestors and anything directly inside it whose
+# name starts with a dot (~/.config, ~/.bashrc, ...) are never made writable
+# via -d or --rw. Socket masks and --hide are applied last, so --rw can't
+# undo them.
+#
+# Package caches (~/.npm, ~/.cargo/registry, ~/.cache, ...) are overlaid, so
+# installs and builds work but whatever they write is discarded on exit and
+# can't poison the real cache. This needs bwrap >= 0.10 and a kernel with
+# unprivileged overlayfs (>= 5.11); without them the caches stay read-only.
+#
+# By default the config/state paths of claude, codex, omp and opencode are
+# writable (see agent_paths below). Note an agent can use these to escape on
+# your next unsandboxed run (hooks, plugins, notify commands), so use
+# --no-agent-paths with --overlay ~ for untrusted work.
+
+set -euo pipefail
+
+usage() { sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0"; }
+die() { echo "agent-sandbox: $*" >&2; exit 1; }
+
+command -v bwrap >/dev/null || die "bwrap not found (install bubblewrap)"
+
+workdir=$PWD
+share_tmp=0 net=1 protect_git=1 verbose=0 agent_paths=1
+hide_secrets=1 overlay_caches=1
+rw=() ro=() hide=() overlay=()
+
+while (($#)); do
+  case $1 in
+    -d|--dir)      workdir=${2:?}; shift 2 ;;
+    --rw)          rw+=("${2:?}"); shift 2 ;;
+    --ro)          ro+=("${2:?}"); shift 2 ;;
+    --hide)        hide+=("${2:?}"); shift 2 ;;
+    --overlay)     overlay+=("${2:?}"); shift 2 ;;
+    --share-tmp)   share_tmp=1; shift ;;
+    --no-net)      net=0; shift ;;
+    --no-protect-git) protect_git=0; shift ;;
+    --no-hide-secrets) hide_secrets=0; shift ;;
+    --no-overlay-caches) overlay_caches=0; shift ;;
+    --no-agent-paths) agent_paths=0; shift ;;
+    -v|--verbose)  verbose=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            die "unknown option: $1 (see --help)" ;;
+    *)             break ;;
+  esac
+done
+
+(($#)) || { usage >&2; die "no command given (for a shell: agent-sandbox -- bash)"; }
+
+home=$(realpath -e -- "$HOME") || die "HOME does not exist: $HOME"
+cfg=${XDG_CONFIG_HOME:-$HOME/.config} data=${XDG_DATA_HOME:-$HOME/.local/share}
+state=${XDG_STATE_HOME:-$HOME/.local/state} cache=${XDG_CACHE_HOME:-$HOME/.cache}
+bwrap_help=$(bwrap --help 2>&1 || true)
+
+# Hidden by default: credentials, browser profiles (cookies), password stores
+# and shell history. The network is on, so anything readable can be sent out.
+secret_paths=(
+  ~/.ssh ~/.gnupg ~/.password-store "$data/keyrings" ~/.pki
+  ~/.aws ~/.azure "$cfg/gcloud" ~/.kube ~/.docker ~/.vault-token
+  "$cfg/gh" "$cfg/hub" ~/.netrc ~/.git-credentials
+  ~/.npmrc ~/.pypirc ~/.cargo/credentials ~/.cargo/credentials.toml
+  ~/.terraform.d/credentials.tfrc.json "$cfg/rclone"
+  ~/.1password "$cfg/1Password" "$cfg/Bitwarden"
+  ~/.mozilla ~/.thunderbird ~/snap/firefox "$cfg/google-chrome"
+  "$cfg/chromium" "$cfg/BraveSoftware" "$cfg/microsoft-edge" "$cfg/vivaldi"
+  ~/.bash_history ~/.zsh_history ~/.histfile "$data/fish/fish_history"
+  ~/.python_history ~/.node_repl_history ~/.psql_history ~/.mysql_history
+  ~/.sqlite_history ~/.lesshst
+)
+
+# Overlaid by default: package manager caches and toolchain installs.
+cache_paths=(
+  "$cache" ~/.npm ~/.yarn ~/.bun ~/.deno "$data/pnpm"
+  ~/.cargo/registry ~/.cargo/git ~/.rustup
+  ~/go ~/.m2 ~/.gradle ~/.nuget ~/.ivy2 ~/.sbt ~/.cabal ~/.stack ~/.opam
+  ~/.gem ~/.composer "$cfg/composer"
+)
+
+# Refuse to make PATH writable if that would expose / or the home directory
+# (shell rc files, ~/.local/bin, autostart, ...). With "dotfiles", also refuse
+# anything directly in home starting with a dot; agent dirs skip that check
+# since ~/.claude etc. are exactly that.
+check_writable() {
+  local p=$1 dotfiles=${2:-1}
+  [[ $p != / ]] || die "refusing to make / writable"
+  [[ $p != "$home" ]] || die "refusing to make your home directory writable: $p"
+  [[ $home != "$p"/* ]] || die "refusing to make an ancestor of your home directory writable: $p"
+  if ((dotfiles)) && [[ ${p%/*} == "$home" && ${p##*/} == .* ]]; then
+    die "refusing to make a dotfile/dot-directory in your home writable: $p"
+  fi
+}
+
+workdir=$(realpath -e -- "$workdir") || die "no such directory: $workdir"
+[[ -d $workdir ]] || die "not a directory: $workdir"
+check_writable "$workdir"
+
+# Default paths are skipped if missing, or if hiding/overlaying them would
+# cover the work directory.
+add_defaults() {
+  local -n into=$1; shift
+  local p
+  for p; do
+    p=$(realpath -e -- "$p" 2>/dev/null) || continue
+    [[ $workdir/ != "$p"/* ]] || continue
+    into+=("$p")
+  done
+}
+((hide_secrets)) && add_defaults hide "${secret_paths[@]}"
+if ((overlay_caches)) && grep -q -- --tmp-overlay <<<"$bwrap_help"; then
+  add_defaults overlay "${cache_paths[@]}"
+fi
+
+args=(
+  --ro-bind / /
+  --dev /dev
+  --proc /proc
+  --unshare-all
+  --die-with-parent
+  --cap-drop ALL
+  --setenv AGENT_SANDBOX "$workdir"
+)
+((net)) && args+=(--share-net)
+
+# Stop the sandboxed process from creating nested user namespaces (a large
+# kernel attack surface). Needs bwrap >= 0.8 and a mandatory user namespace.
+if grep -q -- --disable-userns <<<"$bwrap_help"; then
+  args+=(--unshare-user --disable-userns)
+fi
+
+# Writes discarded on exit (needs a kernel with unprivileged overlayfs, >= 5.11).
+for p in "${overlay[@]}"; do
+  p=$(realpath -e -- "$p") || die "no such path: $p"
+  args+=(--overlay-src "$p" --tmp-overlay "$p")
+done
+
+if ((share_tmp)); then
+  args+=(--bind /tmp /tmp)
+else
+  args+=(--tmpfs /tmp)
+fi
+args+=(--tmpfs /var/tmp)
+
+args+=(--bind "$workdir" "$workdir")
+
+# Agent config/state. Directories are created if missing; files are only
+# bound if they exist (bwrap needs a target, and an empty file isn't valid
+# config).
+if ((agent_paths)); then
+  agent_dirs=(
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    "${CODEX_HOME:-$HOME/.codex}"
+    "${OMP_CODING_AGENT_DIR:-$HOME/.omp}"
+    "$cfg/opencode" "$data/opencode" "$state/opencode" "$cache/opencode"
+  )
+  agent_files=()
+  [[ -z ${CLAUDE_CONFIG_DIR:-} ]] && agent_files+=("$HOME/.claude.json")
+  for d in "${agent_dirs[@]}"; do
+    # Check before mkdir, so e.g. CODEX_HOME=$HOME is refused, not created.
+    check_writable "$(realpath -m -- "$d")" 0
+    mkdir -p -- "$d"
+    d=$(realpath -e -- "$d")
+    check_writable "$d" 0
+    args+=(--bind "$d" "$d")
+  done
+  for f in "${agent_files[@]}"; do
+    [[ -f $f ]] || continue
+    f=$(realpath -e -- "$f")
+    check_writable "$f" 0
+    args+=(--bind "$f" "$f")
+  done
+  # The installed binaries stay read-only, so self-updates can't work in here.
+  args+=(--setenv DISABLE_AUTOUPDATER 1)
+fi
+
+for p in "${rw[@]}"; do
+  p=$(realpath -e -- "$p") || die "no such path: $p"
+  check_writable "$p"
+  args+=(--bind "$p" "$p")
+done
+
+((protect_git)) && [[ -e $workdir/.git ]] && ro+=("$workdir/.git")
+for p in "${ro[@]}"; do
+  p=$(realpath -e -- "$p") || die "no such path: $p"
+  args+=(--ro-bind "$p" "$p")
+done
+
+# A read-only mount does not stop connect() on a Unix socket. Mask sockets that
+# would let the agent run code outside the sandbox (Docker/Podman = root, the
+# user D-Bus/systemd session = arbitrary commands as you, SSH agent = your
+# keys, terminal/editor remote control = typing into your shell). These come
+# after all writable binds so --rw can't bring them back.
+run_user=/run/user/$UID
+[[ -d $run_user ]] && args+=(--tmpfs "$run_user")
+mask_socket() {
+  local s=${1#unix:}
+  [[ -n $s && $s == /* ]] || return 0
+  s=$(realpath -e -- "$s" 2>/dev/null) || return 0
+  [[ -S $s && $s != "$run_user"/* ]] || return 0
+  args+=(--ro-bind /dev/null "$s")
+}
+for s in /run/docker.sock /var/run/docker.sock /run/podman/podman.sock \
+         /run/containerd/containerd.sock \
+         "${SSH_AUTH_SOCK:-}" "${KITTY_LISTEN_ON:-}" "${VSCODE_IPC_HOOK_CLI:-}"; do
+  mask_socket "$s"
+done
+dbus=${DBUS_SESSION_BUS_ADDRESS:-}
+[[ $dbus == unix:path=* ]] && { dbus=${dbus#unix:path=}; mask_socket "${dbus%%,*}"; }
+for v in DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK KITTY_LISTEN_ON VSCODE_IPC_HOOK_CLI; do
+  args+=(--unsetenv "$v")
+done
+
+for p in "${hide[@]}"; do
+  p=$(realpath -e -- "$p") || die "no such path: $p"
+  if [[ -d $p ]]; then
+    args+=(--tmpfs "$p" --remount-ro "$p")
+  else
+    args+=(--ro-bind /dev/null "$p")
+  fi
+done
+
+args+=(--chdir "$workdir")
+
+if ((verbose)); then
+  printf 'bwrap' >&2; printf ' %q' "${args[@]}" -- "$@" >&2; echo >&2
+fi
+
+exec bwrap "${args[@]}" -- "$@"
