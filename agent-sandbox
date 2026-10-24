@@ -11,6 +11,8 @@
 #   --overlay PATH    PATH looks writable, but all writes are discarded on exit
 #   --share-tmp       Use the host /tmp (writable) instead of a private one
 #   --no-net          Disable networking
+#   --cpus N          Only let the sandbox run on N CPUs (logical cores), so
+#                     heavy builds can't take over the machine (default: all)
 #   --no-protect-git  Leave DIR/.git writable (by default it's read-only, which
 #                     stops planting git hooks)
 #   --no-hide-secrets Don't hide credentials, browser profiles and shell
@@ -39,6 +41,15 @@
 # writable (see agent_paths below). Note an agent can use these to escape on
 # your next unsandboxed run (hooks, plugins, notify commands), so use
 # --no-agent-paths with --overlay ~ for untrusted work.
+#
+# --cpus pins the sandbox to the last N CPUs it may run on (CPU affinity, via
+# `taskset`), leaving the rest free for you. Build tools that size their job
+# count from the visible cores (nproc, make -j$(nproc), ninja, cargo, go) start
+# N jobs instead of one per host core, which also keeps memory use down. A
+# seccomp filter stops anything inside from undoing it: sched_setaffinity
+# fails with EPERM (so `taskset` and thread pinning fail inside), and io_uring
+# with ENOSYS, as its kernel threads can be moved to other CPUs (programs fall
+# back to normal I/O). Supported on x86_64 and aarch64.
 
 set -euo pipefail
 
@@ -67,7 +78,7 @@ tilde() { local p=$1; [[ $p == "$home"* ]] && p="~${p#"$home"}"; printf '%s' "$p
 command -v bwrap >/dev/null || die "bwrap not found (install bubblewrap)"
 
 workdir=$PWD
-share_tmp=0 net=1 protect_git=1 verbose=0 quiet=0 agent_paths=1
+share_tmp=0 net=1 protect_git=1 verbose=0 quiet=0 agent_paths=1 cpus=
 hide_secrets=1 overlay_caches=1
 rw=() ro=() hide=() overlay=()
 
@@ -80,6 +91,7 @@ while (($#)); do
     --overlay)     overlay+=("${2:?}"); shift 2 ;;
     --share-tmp)   share_tmp=1; shift ;;
     --no-net)      net=0; shift ;;
+    --cpus)        cpus=${2:?}; shift 2 ;;
     --no-protect-git) protect_git=0; shift ;;
     --no-hide-secrets) hide_secrets=0; shift ;;
     --no-overlay-caches) overlay_caches=0; shift ;;
@@ -94,6 +106,69 @@ while (($#)); do
 done
 
 (($#)) || { usage >&2; die "no command given (for a shell: agent-sandbox -- bash)"; }
+
+# CPU affinity: take the last N CPUs we're allowed to run on (CPU 0 tends to
+# get the most interrupts, and keeping it free helps the desktop stay usable).
+launcher=()
+if [[ -n $cpus ]]; then
+  [[ $cpus =~ ^[0-9]+$ ]] && ((10#$cpus > 0)) || die "--cpus needs a positive whole number of CPUs: $cpus"
+  cpus=$((10#$cpus))
+  command -v taskset >/dev/null || die "--cpus needs taskset (install util-linux)"
+  allowed=() list=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)
+  IFS=, read -ra ranges <<<"$list"
+  for r in "${ranges[@]}"; do
+    for ((c = ${r%-*}; c <= ${r#*-}; c++)); do allowed+=("$c"); done
+  done
+  ((cpus <= ${#allowed[@]})) || die "--cpus $cpus: only ${#allowed[@]} CPUs available"
+  # Back to a range list (18-23 rather than 18,19,...,23) for the summary.
+  cpu_list= start= prev=
+  for c in "${allowed[@]: -cpus}" -; do
+    if [[ -n $prev && $c == $((prev + 1)) ]]; then prev=$c; continue; fi
+    if [[ -n $prev ]]; then
+      cpu_list+=${cpu_list:+,}$start
+      [[ $start == "$prev" ]] || cpu_list+=-$prev
+    fi
+    start=$c prev=$c
+  done
+  launcher=(taskset -c "$cpu_list")
+  # The ABIs the kernel runs, as arch:sched_setaffinity:mask (see cpu_lock_bpf).
+  case $(uname -m) in
+    x86_64)  bpf_abis=(0xc000003e:203:0xbfffffff 0x40000003:241:) ;;  # x86_64/x32, i386
+    aarch64) bpf_abis=(0xc00000b7:122: 0x40000028:241:) ;;            # arm64, arm
+    *)       die "--cpus isn't supported on $(uname -m)" ;;
+  esac
+fi
+
+# Seccomp filter (classic BPF, written out byte by byte) that keeps the --cpus
+# affinity from being undone: EPERM for sched_setaffinity, ENOSYS for io_uring
+# (425-427 on every ABI). Each ABI is checked separately, since a 64-bit kernel
+# also runs 32-bit code with different syscall numbers; the mask strips the x32
+# bit. Calls from any ABI not listed kill the process, so nothing slips past.
+cpu_lock_bpf() {
+  local -a ins=()
+  local -A at=()
+  local abi arch nr mask i code jt jf k
+  for abi in "${bpf_abis[@]}"; do
+    IFS=: read -r arch nr mask <<<"$abi"
+    ins+=("0x20 0 0 4" "0x15 0 next$arch $arch" "0x20 0 0 0")  # arch, syscall nr
+    [[ -z $mask ]] || ins+=("0x54 0 0 $mask")
+    ins+=("0x15 eperm 0 $nr" "0x35 0 allow 425" "0x25 allow enosys 427")
+    at[next$arch]=${#ins[@]}
+  done
+  ins+=("0x06 0 0 0x80000000")                          # kill process
+  at[allow]=${#ins[@]};  ins+=("0x06 0 0 0x7fff0000")
+  at[eperm]=${#ins[@]};  ins+=("0x06 0 0 0x00050001")   # errno EPERM
+  at[enosys]=${#ins[@]}; ins+=("0x06 0 0 0x00050026")   # errno ENOSYS
+  # struct sock_filter, little-endian: u16 code, u8 jt, u8 jf, u32 k. Jumps
+  # are relative to the next instruction.
+  for i in "${!ins[@]}"; do
+    read -r code jt jf k <<<"${ins[i]}"
+    [[ $jt != [a-z]* ]] || jt=$((at[$jt] - i - 1))
+    [[ $jf != [a-z]* ]] || jf=$((at[$jf] - i - 1))
+    printf "$(printf '\\x%02x' $((code & 255)) $((code >> 8)) "$jt" "$jf" \
+      $((k & 255)) $((k >> 8 & 255)) $((k >> 16 & 255)) $((k >> 24 & 255)))"
+  done
+}
 
 home=$(realpath -e -- "$HOME") || die "HOME does not exist: $HOME"
 cfg=${XDG_CONFIG_HOME:-$HOME/.config} data=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -179,6 +254,13 @@ args=(
 # kernel attack surface). Needs bwrap >= 0.8 and a mandatory user namespace.
 if grep -q -- --disable-userns <<<"$bwrap_help"; then
   args+=(--unshare-user --disable-userns)
+fi
+
+# bwrap reads the filter from the fd and closes it, and applies it to the
+# sandbox's PID 1 as well as the command.
+if [[ -n $cpus ]]; then
+  exec {bpf_fd}< <(cpu_lock_bpf)
+  args+=(--seccomp "$bpf_fd")
 fi
 
 # Writes discarded on exit (needs a kernel with unprivileged overlayfs, >= 5.11).
@@ -299,11 +381,17 @@ if ! ((quiet)) && [[ -t 2 ]]; then
       "$(onoff "$net" on off)" \
       "$(if [[ -e $workdir/.git ]]; then onoff "$git_ro" read-only writable; else printf "%s" "${D}none${N}"; fi)" \
       "$(onoff "$((!share_tmp))" private shared)"
+    if [[ -n $cpus ]]; then
+      printf "  ${D}%-8s${N} %s ${D}(cpus %s)${N}\n" cpu "${Y}$cpus of ${#allowed[@]}${N}" "$cpu_list"
+    else
+      printf "  ${D}%-8s${N} %s\n" cpu all
+    fi
   } >&2
 fi
 
 if ((verbose)); then
+  ((${#launcher[@]})) && printf '%q ' "${launcher[@]}" >&2
   printf 'bwrap' >&2; printf ' %q' "${args[@]}" -- "$@" >&2; echo >&2
 fi
 
-exec bwrap "${args[@]}" -- "$@"
+exec "${launcher[@]}" bwrap "${args[@]}" -- "$@"
